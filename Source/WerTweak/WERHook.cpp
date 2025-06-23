@@ -30,16 +30,14 @@
 #include "WERUIHook.h"
 #include "WERUIExportHook.h"
 
-static const LPCSTR g_szPssDuplicateSnapshotName = "PssDuplicateSnapshot";
+/*
+ * Some of the DbgOut() calls below (e.g. in NewWERPssWalkSnapshot) occur in WerFault's hot code
+ * paths and introduce too much delay in its execution. These are compiled out by default, but can
+ * be included again by uncommenting this define.
+ */
+//#define COMPILE_DBGOUT_CALLS_IN_HOT_PATHS
 
-typedef DWORD (WINAPI *PPSS_DUPLICATE_SNAPSHOT) (HANDLE                 SourceProcessHandle,
-                                                 HPSS                   SnapshotHandle,
-                                                 HANDLE                 TargetProcessHandle,
-                                                 HPSS                  *TargetSnapshotHandle,
-                                                 PSS_DUPLICATE_FLAGS    Flags);
-
-PVOID                       g_pPrevPssDuplicateSnapshot     = NULL;
-PRESOLVE_DELAY_LOADED_API   g_pPrevWERResolveDelayLoadedAPI = NULL;
+PRESOLVE_DELAY_LOADED_API g_pPrevWERResolveDelayLoadedAPI = NULL;
 
 void WERTryHookDelayLoadImport(PVOID               ParentModuleBase,
                                PIMAGE_THUNK_DATA   ThunkAddress,
@@ -150,27 +148,96 @@ PVOID WINAPI WERNewResolveDelayLoadedAPI(PVOID                             Paren
     return pImportAddress;
 }
 
-DWORD WINAPI NewPssDuplicateSnapshot(HANDLE                 SourceProcessHandle,
-                                     HPSS                   SnapshotHandle,
-                                     HANDLE                 TargetProcessHandle,
-                                     HPSS                  *TargetSnapshotHandle,
-                                     PSS_DUPLICATE_FLAGS    Flags)
+PVOID g_pPrevWERPssQuerySnapshot = NULL;
+
+DWORD WINAPI NewWERPssQuerySnapshot(HPSS                           SnapshotHandle,
+                                    PSS_QUERY_INFORMATION_CLASS    InformationClass,
+                                    void                          *Buffer,
+                                    DWORD                          BufferLength)
 {
     DWORD dwResult;
 
-    DbgOut("PssDuplicateSnapshot(0x%p)", SnapshotHandle);
+    DbgOut("WER PssQuerySnapshot(0x%p)", SnapshotHandle);
 
-    SnapshotHandle = TranslateSnapshotHandleByDebugger(SnapshotHandle);
+    SnapshotHandle = TranslateSnapshotHandleByDebugger(SnapshotHandle, 0);
 
     DbgOut("  handle after translation: 0x%p", SnapshotHandle);
 
-    dwResult = ((PPSS_DUPLICATE_SNAPSHOT)g_pPrevPssDuplicateSnapshot)(SourceProcessHandle,
-                                                                      SnapshotHandle,
-                                                                      TargetProcessHandle,
-                                                                      TargetSnapshotHandle,
-                                                                      Flags);
+    dwResult = ((PPSS_QUERY_SNAPSHOT)g_pPrevWERPssQuerySnapshot)(SnapshotHandle,
+                                                                 InformationClass,
+                                                                 Buffer,
+                                                                 BufferLength);
 
     DbgOut("  result=%u", dwResult);
+
+    return dwResult;
+}
+
+PVOID g_pPrevWERPssDuplicateSnapshot = NULL;
+
+DWORD WINAPI NewWERPssDuplicateSnapshot(HANDLE                 SourceProcessHandle,
+                                        HPSS                   SnapshotHandle,
+                                        HANDLE                 TargetProcessHandle,
+                                        HPSS                  *TargetSnapshotHandle,
+                                        PSS_DUPLICATE_FLAGS    Flags)
+{
+    DWORD dwResult;
+
+    DbgOut("WER PssDuplicateSnapshot(0x%p)", SnapshotHandle);
+
+    SnapshotHandle = TranslateSnapshotHandleByDebugger(SnapshotHandle, 0);
+
+    DbgOut("  handle after translation: 0x%p", SnapshotHandle);
+
+    dwResult = ((PPSS_DUPLICATE_SNAPSHOT)g_pPrevWERPssDuplicateSnapshot)(SourceProcessHandle,
+                                                                         SnapshotHandle,
+                                                                         TargetProcessHandle,
+                                                                         TargetSnapshotHandle,
+                                                                         Flags);
+
+    DbgOut("  result=%u", dwResult);
+
+    return dwResult;
+}
+
+PVOID g_pPrevWERPssWalkSnapshot = NULL;
+
+DWORD WINAPI NewWERPssWalkSnapshot(HPSS                         SnapshotHandle,
+                                   PSS_WALK_INFORMATION_CLASS   InformationClass,
+                                   HPSSWALK                     WalkMarkerHandle,
+                                   void                        *Buffer,
+                                   DWORD                        BufferLength)
+{
+    DWORD dwResult;
+
+#if defined(COMPILE_DBGOUT_CALLS_IN_HOT_PATHS)
+    DbgOut("WER PssWalkSnapshot(0x%p, %u)", SnapshotHandle, InformationClass);
+#endif
+
+    /*
+     * Note: PssWalkSnapshot() gets called a *lot* (several thousands of times) by WerFault. The
+     * DbgOut() calls in WerTweakInject.cpp that are triggered by process snapshot handle
+     * translation introduce too much delay to allow WerFault to complete in a reasonable amount of
+     * time. So we pass the TRANSLATE_PROCESS_SNAPSHOT_HANDLE_FLAG_SUPPRESS_DBG_OUTPUT flag that
+     * suppresses these calls.
+     */
+    SnapshotHandle = TranslateSnapshotHandleByDebugger(
+            SnapshotHandle,
+            TRANSLATE_PROCESS_SNAPSHOT_HANDLE_FLAG_SUPPRESS_DBG_OUTPUT);
+
+#if defined(COMPILE_DBGOUT_CALLS_IN_HOT_PATHS)
+    DbgOut("  handle after translation: 0x%p", SnapshotHandle);
+#endif
+
+    dwResult = ((PPSS_WALK_SNAPSHOT)g_pPrevWERPssWalkSnapshot)(SnapshotHandle,
+                                                               InformationClass,
+                                                               WalkMarkerHandle,
+                                                               Buffer,
+                                                               BufferLength);
+
+#if defined(COMPILE_DBGOUT_CALLS_IN_HOT_PATHS)
+    DbgOut("  result=%u", dwResult);
+#endif
 
     return dwResult;
 }
@@ -205,10 +272,20 @@ void CWERHook::PatchImportedModule(PIMAGE_THUNK_DATA pOrigFirstThunk,
                         WERNewResolveDelayLoadedAPI,
                         (PVOID *)&g_pPrevWERResolveDelayLoadedAPI);
         }
+        else if (lstrcmpA(importName, g_szPssQuerySnapshotName) == 0)
+        {
+            // TODO: add error checking
+            PatchImport(pThunk, NewWERPssQuerySnapshot, (PVOID *)&g_pPrevWERPssQuerySnapshot);
+        }
         else if (lstrcmpA(importName, g_szPssDuplicateSnapshotName) == 0)
         {
             // TODO: add error checking
-            PatchImport(pThunk, NewPssDuplicateSnapshot, (PVOID *)&g_pPrevPssDuplicateSnapshot);
+            PatchImport(pThunk, NewWERPssDuplicateSnapshot, (PVOID *)&g_pPrevWERPssDuplicateSnapshot);
+        }
+        else if (lstrcmpA(importName, g_szPssWalkSnapshotName) == 0)
+        {
+            // TODO: add error checking
+            PatchImport(pThunk, NewWERPssWalkSnapshot, (PVOID *)&g_pPrevWERPssWalkSnapshot);
         }
 
 next:
